@@ -1,9 +1,9 @@
 name: Fetch Weather Data
 
 on:
-  # Run every 15 minutes
+  # Run every hour at minute 20 (after LI-COR updates)
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '20 * * * *'
   
   # Allow manual trigger from GitHub UI
   workflow_dispatch:
