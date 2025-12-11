@@ -1,0 +1,42 @@
+name: Fetch Weather Data
+
+on:
+  # Run every 15 minutes
+  schedule:
+    - cron: '*/15 * * * *'
+  
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  fetch-weather-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          cd scripts
+          npm install
+
+      - name: Fetch weather data and update Firebase
+        env:
+          LICOR_API_TOKEN: ${{ secrets.LICOR_API_TOKEN }}
+          LICOR_DEVICE_SERIAL: ${{ secrets.LICOR_DEVICE_SERIAL }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.FIREBASE_MESSAGING_SENDER_ID }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+        run: |
+          cd scripts
+          node fetchWeatherData.js
