@@ -128,14 +128,16 @@ async function main() {
   const database = getDatabase(app);
 
   // Calculate time range (last 9 days)
-   const endTime = Date.now();
-   const startTime = endTime - (9 * 24 * 60 * 60 * 1000);
+  const endTime = Date.now();
+  const startTime = endTime - (9 * 24 * 60 * 60 * 1000);
 
   console.log(`📅 Fetching data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}\n`);
 
   // Fetch all sensors sequentially
   const sensorKeys = Object.keys(SENSORS);
-  const results = [];
+  const latestValues = {};
+  let totalRecords = 0;
+  let successfulSensors = 0;
 
   console.log(`📡 Fetching ${sensorKeys.length} sensors from LI-COR API...\n`);
 
@@ -146,9 +148,30 @@ async function main() {
     console.log(`  [${i + 1}/${sensorKeys.length}] ${sensorConfig.name}...`);
 
     const result = await fetchSensor(sensorKey, sensorConfig, startTime, endTime);
-    results.push(result);
+    
+    const recordCount = result.data.length;
+    totalRecords += recordCount;
+    
+    if (recordCount > 0) {
+      successfulSensors++;
+      latestValues[sensorKey] = result.data[result.data.length - 1].value;
+    }
 
-    console.log(`    ✅ ${result.data.length} records`);
+    console.log(`    ✅ ${recordCount} records`);
+
+    // Write each sensor's data to Firebase individually to avoid size limits
+    if (result.data.length > 0) {
+      try {
+        await set(ref(database, `sensorData/${sensorKey}`), {
+          data: result.data,
+          lastUpdated: Date.now(),
+          recordCount: result.data.length,
+        });
+        console.log(`    💾 Saved to Firebase`);
+      } catch (error) {
+        console.error(`    ❌ Failed to save ${sensorKey}: ${error.message}`);
+      }
+    }
 
     // Delay between requests to avoid rate limiting
     if (i < sensorKeys.length - 1) {
@@ -156,44 +179,31 @@ async function main() {
     }
   }
 
-  // Prepare data for Firebase
-  const weatherData = {
-    results,
-    timeRange: { startTime, endTime },
-    fetchedAt: Date.now(),
-    cachedAt: Date.now(),
-  };
-
-  // Count total records
-  const totalRecords = results.reduce((sum, r) => sum + r.data.length, 0);
-  const successfulSensors = results.filter(r => r.data.length > 0).length;
-
   console.log(`\n📊 Summary:`);
   console.log(`   - Sensors fetched: ${successfulSensors}/${sensorKeys.length}`);
   console.log(`   - Total records: ${totalRecords}`);
 
-  // Write to Firebase
-  console.log('\n💾 Writing to Firebase...');
+  // Write metadata (small object, won't hit size limit)
+  console.log('\n💾 Writing metadata to Firebase...');
   
   try {
-    await set(ref(database, 'weatherData'), weatherData);
-    console.log('   ✅ Data saved successfully!\n');
+    await set(ref(database, 'weatherData/metadata'), {
+      timeRange: { startTime, endTime },
+      fetchedAt: Date.now(),
+      cachedAt: Date.now(),
+      sensorCount: successfulSensors,
+      totalRecords: totalRecords,
+      latestValues: latestValues,
+    });
+    console.log('   ✅ Metadata saved successfully!');
   } catch (error) {
-    console.error(`   ❌ Failed to write to Firebase: ${error.message}`);
+    console.error(`   ❌ Failed to write metadata: ${error.message}`);
     process.exit(1);
   }
 
-  // Also store a history entry (optional - for trend analysis)
+  // Store a history entry (just latest values, not full time series)
   const historyRef = ref(database, `weatherHistory/${Date.now()}`);
   try {
-    // Store just the latest values for history (not full time series)
-    const latestValues = {};
-    results.forEach(({ sensorKey, data }) => {
-      if (data.length > 0) {
-        latestValues[sensorKey] = data[data.length - 1].value;
-      }
-    });
-    
     await set(historyRef, {
       timestamp: Date.now(),
       values: latestValues,
@@ -208,6 +218,9 @@ async function main() {
 
 // Run
 main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
   console.error('Fatal error:', error);
   process.exit(1);
 });
