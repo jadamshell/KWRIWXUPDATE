@@ -127,9 +127,9 @@ async function main() {
   const app = initializeApp(FIREBASE_CONFIG);
   const database = getDatabase(app);
 
-  // Calculate time range (last 24 hours)
-  const endTime = Date.now();
-  const startTime = endTime - (24 * 60 * 60 * 1000);
+  // Calculate time range (last 9 days)
+   const endTime = Date.now();
+   const startTime = endTime - (9 * 24 * 60 * 60 * 1000);
 
   console.log(`📅 Fetching data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}\n`);
 
