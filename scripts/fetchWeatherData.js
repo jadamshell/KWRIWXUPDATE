@@ -244,6 +244,9 @@ async function main() {
   }
 
   console.log('🎉 Done!\n');
+  
+  // Exit cleanly (Firebase keeps connection open otherwise)
+  process.exit(0);
 }
 
 // Run
@@ -251,3 +254,4 @@ main().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
+
