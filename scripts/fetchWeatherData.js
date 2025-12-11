@@ -1,9 +1,10 @@
 /**
  * Weather Data Fetcher for GitHub Actions
  * ========================================
- * This script runs on a schedule via GitHub Actions to:
- * 1. Fetch data from all LI-COR sensors
- * 2. Write the data to Firebase Realtime Database
+ * This script runs hourly to:
+ * 1. Fetch the last 2 hours of data from LI-COR sensors
+ * 2. Append new records to existing Firebase data
+ * 3. Trim data older than 9 days
  * 
  * Environment variables required (set as GitHub Secrets):
  * - LICOR_API_TOKEN
@@ -30,6 +31,9 @@ const FIREBASE_CONFIG = {
   messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
   appId: process.env.FIREBASE_APP_ID,
 };
+
+// How many days of data to keep
+const DAYS_TO_KEEP = 9;
 
 // All sensors to fetch (17 total)
 const SENSORS = {
@@ -108,8 +112,8 @@ async function fetchSensor(sensorKey, sensorConfig, startTime, endTime, retries 
 
 // Main function
 async function main() {
-  console.log('🌤️  Weather Data Fetcher');
-  console.log('========================\n');
+  console.log('🌤️  Weather Data Fetcher (Hourly Append Mode)');
+  console.log('=============================================\n');
 
   // Validate environment variables
   if (!LICOR_CONFIG.apiToken) {
@@ -127,16 +131,18 @@ async function main() {
   const app = initializeApp(FIREBASE_CONFIG);
   const database = getDatabase(app);
 
-  // Calculate time range (last 9 days)
+  // Calculate time range (last 2 hours to catch hourly updates)
   const endTime = Date.now();
-  const startTime = endTime - (9 * 24 * 60 * 60 * 1000);
+  const startTime = endTime - (2 * 60 * 60 * 1000); // 2 hours ago
+  const cutoffTime = endTime - (DAYS_TO_KEEP * 24 * 60 * 60 * 1000); // 9 days ago
 
-  console.log(`📅 Fetching data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}\n`);
+  console.log(`📅 Fetching new data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`);
+  console.log(`🗑️  Will trim data older than ${new Date(cutoffTime).toISOString()}\n`);
 
   // Fetch all sensors sequentially
   const sensorKeys = Object.keys(SENSORS);
   const latestValues = {};
-  let totalRecords = 0;
+  let totalNewRecords = 0;
   let successfulSensors = 0;
 
   console.log(`📡 Fetching ${sensorKeys.length} sensors from LI-COR API...\n`);
@@ -147,52 +153,87 @@ async function main() {
 
     console.log(`  [${i + 1}/${sensorKeys.length}] ${sensorConfig.name}...`);
 
+    // Fetch new data from LI-COR
     const result = await fetchSensor(sensorKey, sensorConfig, startTime, endTime);
+    const newRecords = result.data;
     
-    const recordCount = result.data.length;
-    totalRecords += recordCount;
-    
-    if (recordCount > 0) {
-      successfulSensors++;
-      latestValues[sensorKey] = result.data[result.data.length - 1].value;
+    console.log(`    📥 ${newRecords.length} new records from LI-COR`);
+
+    // Get existing data from Firebase
+    let existingData = [];
+    try {
+      const snapshot = await get(ref(database, `sensorData/${sensorKey}/data`));
+      if (snapshot.exists()) {
+        existingData = snapshot.val() || [];
+      }
+    } catch (error) {
+      console.log(`    ⚠️ No existing data found, starting fresh`);
     }
 
-    console.log(`    ✅ ${recordCount} records`);
+    console.log(`    📦 ${existingData.length} existing records in Firebase`);
 
-    // Write each sensor's data to Firebase individually to avoid size limits
-    if (result.data.length > 0) {
+    // Create a Set of existing timestamps for fast lookup
+    const existingTimestamps = new Set(existingData.map(r => r.timestamp));
+
+    // Filter new records to only include ones we don't already have
+    const trulyNewRecords = newRecords.filter(r => !existingTimestamps.has(r.timestamp));
+
+    console.log(`    ✨ ${trulyNewRecords.length} truly new records to add`);
+
+    // Merge: existing + new
+    const mergedData = [...existingData, ...trulyNewRecords];
+
+    // Trim: remove records older than cutoff
+    const trimmedData = mergedData.filter(r => r.timestamp >= cutoffTime);
+
+    const trimmedCount = mergedData.length - trimmedData.length;
+    if (trimmedCount > 0) {
+      console.log(`    🗑️  Trimmed ${trimmedCount} old records`);
+    }
+
+    // Sort by timestamp
+    trimmedData.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Update latest value
+    if (trimmedData.length > 0) {
+      successfulSensors++;
+      latestValues[sensorKey] = trimmedData[trimmedData.length - 1].value;
+      totalNewRecords += trulyNewRecords.length;
+    }
+
+    // Save to Firebase
+    if (trimmedData.length > 0) {
       try {
         await set(ref(database, `sensorData/${sensorKey}`), {
-          data: result.data,
+          data: trimmedData,
           lastUpdated: Date.now(),
-          recordCount: result.data.length,
+          recordCount: trimmedData.length,
         });
-        console.log(`    💾 Saved to Firebase`);
+        console.log(`    💾 Saved ${trimmedData.length} total records`);
       } catch (error) {
         console.error(`    ❌ Failed to save ${sensorKey}: ${error.message}`);
       }
     }
 
-    // Delay between requests to avoid rate limiting
+    // Delay between requests
     if (i < sensorKeys.length - 1) {
       await delay(200);
     }
   }
 
   console.log(`\n📊 Summary:`);
-  console.log(`   - Sensors fetched: ${successfulSensors}/${sensorKeys.length}`);
-  console.log(`   - Total records: ${totalRecords}`);
+  console.log(`   - Sensors updated: ${successfulSensors}/${sensorKeys.length}`);
+  console.log(`   - New records added: ${totalNewRecords}`);
 
-  // Write metadata (small object, won't hit size limit)
+  // Write metadata
   console.log('\n💾 Writing metadata to Firebase...');
   
   try {
     await set(ref(database, 'weatherData/metadata'), {
-      timeRange: { startTime, endTime },
+      timeRange: { startTime: cutoffTime, endTime },
       fetchedAt: Date.now(),
       cachedAt: Date.now(),
       sensorCount: successfulSensors,
-      totalRecords: totalRecords,
       latestValues: latestValues,
     });
     console.log('   ✅ Metadata saved successfully!');
@@ -201,7 +242,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Store a history entry (just latest values, not full time series)
+  // Store a history entry
   const historyRef = ref(database, `weatherHistory/${Date.now()}`);
   try {
     await set(historyRef, {
