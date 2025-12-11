@@ -4,7 +4,7 @@
  * This script runs hourly to:
  * 1. Fetch the last 2 hours of data from LI-COR sensors
  * 2. Append new records to existing Firebase data
- * 3. Trim data older than 9 days
+ * 3. Keep all historical data
  * 
  * Environment variables required (set as GitHub Secrets):
  * - LICOR_API_TOKEN
@@ -32,8 +32,7 @@ const FIREBASE_CONFIG = {
   appId: process.env.FIREBASE_APP_ID,
 };
 
-// How many days of data to keep
-const DAYS_TO_KEEP = 9;
+// Keep all historical data (no trimming)
 
 // All sensors to fetch (17 total)
 const SENSORS = {
@@ -134,10 +133,8 @@ async function main() {
   // Calculate time range (last 2 hours to catch hourly updates)
   const endTime = Date.now();
   const startTime = endTime - (2 * 60 * 60 * 1000); // 2 hours ago
-  const cutoffTime = endTime - (DAYS_TO_KEEP * 24 * 60 * 60 * 1000); // 9 days ago
 
-  console.log(`📅 Fetching new data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`);
-  console.log(`🗑️  Will trim data older than ${new Date(cutoffTime).toISOString()}\n`);
+  console.log(`📅 Fetching new data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}\n`);
 
   // Fetch all sensors sequentially
   const sensorKeys = Object.keys(SENSORS);
@@ -183,33 +180,25 @@ async function main() {
     // Merge: existing + new
     const mergedData = [...existingData, ...trulyNewRecords];
 
-    // Trim: remove records older than cutoff
-    const trimmedData = mergedData.filter(r => r.timestamp >= cutoffTime);
-
-    const trimmedCount = mergedData.length - trimmedData.length;
-    if (trimmedCount > 0) {
-      console.log(`    🗑️  Trimmed ${trimmedCount} old records`);
-    }
-
     // Sort by timestamp
-    trimmedData.sort((a, b) => a.timestamp - b.timestamp);
+    mergedData.sort((a, b) => a.timestamp - b.timestamp);
 
     // Update latest value
-    if (trimmedData.length > 0) {
+    if (mergedData.length > 0) {
       successfulSensors++;
-      latestValues[sensorKey] = trimmedData[trimmedData.length - 1].value;
+      latestValues[sensorKey] = mergedData[mergedData.length - 1].value;
       totalNewRecords += trulyNewRecords.length;
     }
 
     // Save to Firebase
-    if (trimmedData.length > 0) {
+    if (mergedData.length > 0) {
       try {
         await set(ref(database, `sensorData/${sensorKey}`), {
-          data: trimmedData,
+          data: mergedData,
           lastUpdated: Date.now(),
-          recordCount: trimmedData.length,
+          recordCount: mergedData.length,
         });
-        console.log(`    💾 Saved ${trimmedData.length} total records`);
+        console.log(`    💾 Saved ${mergedData.length} total records`);
       } catch (error) {
         console.error(`    ❌ Failed to save ${sensorKey}: ${error.message}`);
       }
@@ -230,7 +219,7 @@ async function main() {
   
   try {
     await set(ref(database, 'weatherData/metadata'), {
-      timeRange: { startTime: cutoffTime, endTime },
+      timeRange: { endTime },
       fetchedAt: Date.now(),
       cachedAt: Date.now(),
       sensorCount: successfulSensors,
