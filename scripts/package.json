@@ -1,0 +1,12 @@
+{
+  "name": "weather-data-fetcher",
+  "version": "1.0.0",
+  "description": "GitHub Actions script to fetch LI-COR weather data and store in Firebase",
+  "main": "fetchWeatherData.js",
+  "scripts": {
+    "fetch": "node fetchWeatherData.js"
+  },
+  "dependencies": {
+    "firebase": "^10.8.0"
+  }
+}
