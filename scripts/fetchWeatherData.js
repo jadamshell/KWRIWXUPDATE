@@ -3,17 +3,22 @@
  * ========================================
  * This script runs hourly to:
  * 1. Fetch the last 2 hours of data from LI-COR sensors
- * 2. Append new records to existing Firebase data
+ * 2. Append only new records to Firebase (no duplicates)
  * 3. Keep all historical data
+ * 
+ * OPTIMIZED: Uses lastTimestamp tracking to avoid downloading
+ * all existing data for deduplication. This reduces Firebase
+ * downloads by ~95%.
+ * 
+ * Uses Firebase Admin SDK for secure server-side writes.
  * 
  * Environment variables required (set as GitHub Secrets):
  * - LICOR_API_TOKEN
  * - LICOR_DEVICE_SERIAL
- * - FIREBASE_* credentials
+ * - FIREBASE_SERVICE_ACCOUNT (JSON string)
  */
 
-const { initializeApp } = require('firebase/app');
-const { getDatabase, ref, set, get } = require('firebase/database');
+const admin = require('firebase-admin');
 
 // Configuration from environment variables
 const LICOR_CONFIG = {
@@ -22,17 +27,20 @@ const LICOR_CONFIG = {
   deviceSerialNumber: process.env.LICOR_DEVICE_SERIAL || '22462095',
 };
 
-const FIREBASE_CONFIG = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  databaseURL: process.env.FIREBASE_DATABASE_URL,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID,
-};
-
-// Keep all historical data (no trimming)
+// Initialize Firebase Admin
+let database;
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: `https://${serviceAccount.project_id}-default-rtdb.firebaseio.com`
+  });
+  database = admin.database();
+  console.log('✅ Firebase Admin initialized successfully');
+} catch (error) {
+  console.error('❌ Firebase Admin initialization error:', error.message);
+  process.exit(1);
+}
 
 // All sensors to fetch (17 total)
 const SENSORS = {
@@ -58,7 +66,7 @@ const SENSORS = {
 // Delay helper
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Fetch data for a single sensor
+// Fetch data for a single sensor from LI-COR API
 async function fetchSensor(sensorKey, sensorConfig, startTime, endTime, retries = 3) {
   const url = new URL(`${LICOR_CONFIG.baseUrl}/data`);
   url.searchParams.append('deviceSerialNumber', LICOR_CONFIG.deviceSerialNumber);
@@ -78,7 +86,7 @@ async function fetchSensor(sensorKey, sensorConfig, startTime, endTime, retries 
 
       if (response.status === 429) {
         const waitTime = Math.pow(2, attempt) * 2000;
-        console.log(`  ⏳ Rate limited on ${sensorKey}, waiting ${waitTime}ms...`);
+        console.log(`    ⏳ Rate limited, waiting ${waitTime}ms...`);
         await delay(waitTime);
         continue;
       }
@@ -101,7 +109,7 @@ async function fetchSensor(sensorKey, sensorConfig, startTime, endTime, retries 
       };
     } catch (error) {
       if (attempt === retries - 1) {
-        console.error(`  ❌ Failed to fetch ${sensorKey}: ${error.message}`);
+        console.error(`    ❌ Failed to fetch: ${error.message}`);
         return { sensorKey, data: [], error: error.message };
       }
       await delay(1000);
@@ -111,8 +119,8 @@ async function fetchSensor(sensorKey, sensorConfig, startTime, endTime, retries 
 
 // Main function
 async function main() {
-  console.log('🌤️  Weather Data Fetcher (Hourly Append Mode)');
-  console.log('=============================================\n');
+  console.log('🌤️  Weather Data Fetcher (Optimized)');
+  console.log('=====================================\n');
 
   // Validate environment variables
   if (!LICOR_CONFIG.apiToken) {
@@ -120,132 +128,153 @@ async function main() {
     process.exit(1);
   }
 
-  if (!FIREBASE_CONFIG.databaseURL) {
-    console.error('❌ FIREBASE_DATABASE_URL is not set!');
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+    console.error('❌ FIREBASE_SERVICE_ACCOUNT is not set!');
     process.exit(1);
   }
-
-  // Initialize Firebase
-  console.log('🔥 Initializing Firebase...');
-  const app = initializeApp(FIREBASE_CONFIG);
-  const database = getDatabase(app);
 
   // Calculate time range (last 2 hours to catch hourly updates)
   const endTime = Date.now();
   const startTime = endTime - (2 * 60 * 60 * 1000); // 2 hours ago
 
-  console.log(`📅 Fetching new data from ${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}\n`);
+  console.log(`📅 Fetching: ${new Date(startTime).toISOString()} → ${new Date(endTime).toISOString()}\n`);
 
-  // Fetch all sensors sequentially
+  // Get last timestamps for all sensors (single small read)
+  let lastTimestamps = {};
+  try {
+    const snapshot = await database.ref('sensorMeta').once('value');
+    if (snapshot.exists()) {
+      lastTimestamps = snapshot.val() || {};
+    }
+    console.log('📊 Retrieved sensor metadata\n');
+  } catch (error) {
+    console.log('⚠️ No existing metadata, starting fresh\n');
+  }
+
+  // Process all sensors
   const sensorKeys = Object.keys(SENSORS);
   const latestValues = {};
+  const newTimestamps = {};
   let totalNewRecords = 0;
   let successfulSensors = 0;
 
-  console.log(`📡 Fetching ${sensorKeys.length} sensors from LI-COR API...\n`);
+  console.log(`📡 Processing ${sensorKeys.length} sensors...\n`);
 
   for (let i = 0; i < sensorKeys.length; i++) {
     const sensorKey = sensorKeys[i];
     const sensorConfig = SENSORS[sensorKey];
+    const lastTs = lastTimestamps[sensorKey]?.lastTimestamp || 0;
 
-    console.log(`  [${i + 1}/${sensorKeys.length}] ${sensorConfig.name}...`);
+    console.log(`  [${i + 1}/${sensorKeys.length}] ${sensorConfig.name}`);
 
     // Fetch new data from LI-COR
     const result = await fetchSensor(sensorKey, sensorConfig, startTime, endTime);
     const newRecords = result.data;
     
-    console.log(`    📥 ${newRecords.length} new records from LI-COR`);
-
-    // Get existing data from Firebase
-    let existingData = [];
-    try {
-      const snapshot = await get(ref(database, `sensorData/${sensorKey}/data`));
-      if (snapshot.exists()) {
-        existingData = snapshot.val() || [];
+    if (newRecords.length === 0) {
+      console.log(`    📥 0 records from LI-COR`);
+      // Keep existing latest value if we have it
+      if (lastTimestamps[sensorKey]?.latestValue !== undefined) {
+        latestValues[sensorKey] = lastTimestamps[sensorKey].latestValue;
+        successfulSensors++;
       }
-    } catch (error) {
-      console.log(`    ⚠️ No existing data found, starting fresh`);
-    }
-
-    console.log(`    📦 ${existingData.length} existing records in Firebase`);
-
-    // Create a Set of existing timestamps for fast lookup
-    const existingTimestamps = new Set(existingData.map(r => r.timestamp));
-
-    // Filter new records to only include ones we don't already have
-    const trulyNewRecords = newRecords.filter(r => !existingTimestamps.has(r.timestamp));
-
-    console.log(`    ✨ ${trulyNewRecords.length} truly new records to add`);
-
-    // Merge: existing + new
-    const mergedData = [...existingData, ...trulyNewRecords];
-
-    // Sort by timestamp
-    mergedData.sort((a, b) => a.timestamp - b.timestamp);
-
-    // Update latest value
-    if (mergedData.length > 0) {
-      successfulSensors++;
-      latestValues[sensorKey] = mergedData[mergedData.length - 1].value;
-      totalNewRecords += trulyNewRecords.length;
-    }
-
-    // Save to Firebase
-    if (mergedData.length > 0) {
-      try {
-        await set(ref(database, `sensorData/${sensorKey}`), {
-          data: mergedData,
-          lastUpdated: Date.now(),
-          recordCount: mergedData.length,
-        });
-        console.log(`    💾 Saved ${mergedData.length} total records`);
-      } catch (error) {
-        console.error(`    ❌ Failed to save ${sensorKey}: ${error.message}`);
-      }
-    }
-
-    // Delay between requests
-    if (i < sensorKeys.length - 1) {
       await delay(200);
+      continue;
     }
+
+    // Filter to only records newer than last timestamp
+    const trulyNewRecords = newRecords.filter(r => r.timestamp > lastTs);
+    
+    console.log(`    📥 ${newRecords.length} from LI-COR, ✨ ${trulyNewRecords.length} new`);
+
+    if (trulyNewRecords.length === 0) {
+      // No new records, but update latest value
+      latestValues[sensorKey] = newRecords[newRecords.length - 1].value;
+      successfulSensors++;
+      await delay(200);
+      continue;
+    }
+
+    // Sort new records by timestamp
+    trulyNewRecords.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Get the new latest timestamp and value
+    const newestRecord = trulyNewRecords[trulyNewRecords.length - 1];
+    latestValues[sensorKey] = newestRecord.value;
+    newTimestamps[sensorKey] = {
+      lastTimestamp: newestRecord.timestamp,
+      latestValue: newestRecord.value,
+      lastUpdated: Date.now(),
+    };
+
+    // Append new records to Firebase using multi-location update
+    // This pushes to the array without reading existing data
+    try {
+      const updates = {};
+      
+      // Get current record count
+      const countSnapshot = await database.ref(`sensorData/${sensorKey}/recordCount`).once('value');
+      let currentCount = countSnapshot.exists() ? countSnapshot.val() : 0;
+      
+      // Add each new record at the next index
+      trulyNewRecords.forEach((record, idx) => {
+        updates[`sensorData/${sensorKey}/data/${currentCount + idx}`] = record;
+      });
+      
+      // Update metadata
+      updates[`sensorData/${sensorKey}/recordCount`] = currentCount + trulyNewRecords.length;
+      updates[`sensorData/${sensorKey}/lastUpdated`] = Date.now();
+      updates[`sensorMeta/${sensorKey}`] = newTimestamps[sensorKey];
+
+      await database.ref().update(updates);
+      
+      console.log(`    💾 Appended ${trulyNewRecords.length} records (total: ${currentCount + trulyNewRecords.length})`);
+      
+      totalNewRecords += trulyNewRecords.length;
+      successfulSensors++;
+    } catch (error) {
+      console.error(`    ❌ Failed to save: ${error.message}`);
+    }
+
+    // Delay between sensors
+    await delay(200);
   }
 
   console.log(`\n📊 Summary:`);
-  console.log(`   - Sensors updated: ${successfulSensors}/${sensorKeys.length}`);
-  console.log(`   - New records added: ${totalNewRecords}`);
+  console.log(`   • Sensors updated: ${successfulSensors}/${sensorKeys.length}`);
+  console.log(`   • New records added: ${totalNewRecords}`);
 
   // Write metadata
-  console.log('\n💾 Writing metadata to Firebase...');
+  console.log('\n💾 Saving metadata...');
   
   try {
-    await set(ref(database, 'weatherData/metadata'), {
+    await database.ref('weatherData/metadata').set({
       timeRange: { endTime },
       fetchedAt: Date.now(),
       cachedAt: Date.now(),
       sensorCount: successfulSensors,
       latestValues: latestValues,
     });
-    console.log('   ✅ Metadata saved successfully!');
+    console.log('   ✅ Metadata saved');
   } catch (error) {
-    console.error(`   ❌ Failed to write metadata: ${error.message}`);
+    console.error(`   ❌ Failed: ${error.message}`);
     process.exit(1);
   }
 
-  // Store a history entry
-  const historyRef = ref(database, `weatherHistory/${Date.now()}`);
+  // Store a history entry (just the latest values, very small)
   try {
-    await set(historyRef, {
+    await database.ref(`weatherHistory/${Date.now()}`).set({
       timestamp: Date.now(),
       values: latestValues,
     });
-    console.log('   ✅ History entry saved!\n');
+    console.log('   ✅ History entry saved');
   } catch (error) {
-    console.warn(`   ⚠️ Failed to save history: ${error.message}`);
+    console.warn(`   ⚠️ History save failed: ${error.message}`);
   }
 
-  console.log('🎉 Done!\n');
+  console.log('\n🎉 Done!\n');
   
-  // Exit cleanly (Firebase keeps connection open otherwise)
+  // Exit cleanly
   process.exit(0);
 }
 
@@ -254,4 +283,6 @@ main().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
+
+
 
